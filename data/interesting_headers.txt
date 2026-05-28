@@ -1,0 +1,12 @@
+Server
+X-Powered-By
+X-AI-Backend
+X-RAG-Provider
+X-Model
+X-Inference-Engine
+X-Kong-Upstream-Latency
+Via
+Location
+Content-Type
+Content-Security-Policy
+WWW-Authenticate

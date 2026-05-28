@@ -1,0 +1,1103 @@
+#!/usr/bin/env bash
+# spy-ai — SpyAI: passive reconnaissance for AI-facing systems
+set -euo pipefail
+
+readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly OUTPUT_DIR="${SCRIPT_DIR}/output"
+readonly LOGS_DIR="${OUTPUT_DIR}/logs"
+readonly DEFAULT_PROBE_PATHS="${SCRIPT_DIR}/data/passive_probes.txt"
+readonly DEFAULT_INTERESTING_HEADERS="${SCRIPT_DIR}/data/interesting_headers.txt"
+readonly SCAN_PORTS_PY="${SCRIPT_DIR}/lib/scan_ports.py"
+
+# Common non-AI ports (compact set; use nmap separately for full sweeps).
+readonly -a COMMON_PORTS=(
+  22 25 53 135 139 445 3306 3389 5432 6379 27017
+)
+
+# HTTP-likely ports for AI-facing services
+readonly -a HTTP_LIKELY_PORTS=(
+  80 443 3000 3001 4000 5000 5601
+  $(seq 8000 8080)
+  8081 8443 8888 9000 9001 9200 11434
+)
+
+# Ports treated as HTTPS by default (in addition to service-name heuristics).
+readonly -a HTTPS_PORTS=(443 8443 9200)
+
+PROBE_PATHS=()
+INTERESTING_HEADERS=()
+
+readonly MAX_BODY_BYTES=8192        # bytes captured in exec log per response
+readonly INLINE_BODY_BYTES=200      # bytes inlined into the report's Notes column
+readonly CURL_MAX_TIME=5
+
+TARGET=""
+RUN_ID=""
+ARTIFACT_BASE=""
+PORTS_SCAN_LOG=""
+REPORT_PATH=""
+EXEC_LOG=""
+WORK_DIR=""
+STARTED_AT=""
+FINISHED_AT=""
+SERVICE_DATA=""
+TLS_TIMEOUT_CMD=""
+
+usage() {
+  cat <<'EOF'
+SpyAI — passive reconnaissance for AI-facing systems
+
+Usage: spy-ai <IP|hostname>
+
+Runs a lightweight TCP connect scan (python3) on AI-likely + common ports,
+then HTTP fingerprinting, endpoint discovery, and TLS cert mining.
+
+Outputs (relative to spy-ai/):
+  output/<target>-<N>.md
+  output/logs/<target>-<N>.exec.log
+
+Required: python3, curl
+Optional: openssl, timeout|gtimeout
+
+For full port/version sweeps, run nmap separately and use this tool for AI HTTP discovery.
+EOF
+}
+
+log_msg() { echo "$@" >&2; }
+log_step() { log_msg "  $*"; }
+
+WAIT_SPINNER_PID=""
+
+readonly -a SPYAI_PHRASES=(
+  "mapping the latent attack surface..."
+  "listening for whispers on high ports..."
+  "correlating OpenAPI ghosts in the wire..."
+  "tracing RAG endpoints through the noise..."
+  "fingerprinting inference daemons..."
+  "harvesting TLS fingerprints from the void..."
+  "parsing agent health beacons..."
+  "following fetch() trails in minified JS..."
+  "enumerating /v1/models without credentials..."
+  "sweeping 8000-8080 for sleeping agents..."
+  "decoding Server headers for AI backends..."
+  "mining embedded paths from static HTML..."
+  "watching uvicorn banners blink..."
+  "cataloguing auth challenges on the perimeter..."
+  "building the Markdown dossier..."
+)
+
+color_if_tty() {
+  local code="$1"
+  if [[ -t 2 ]]; then
+    printf '\033[%sm' "$code"
+  fi
+}
+
+color_reset() {
+  color_if_tty 0
+}
+
+show_banner() {
+  local c g d r
+  c="$(color_if_tty 92)"
+  g="$(color_if_tty 32)"
+  w="$(color_if_tty 31)"
+  r="$(color_reset)"
+  cat >&2 <<BANNER
+${c}
+  ███████╗██████╗ ██╗   ██╗ █████╗ ██╗
+  ██╔════╝██╔══██╗╚██╗ ██╔╝██╔══██╗██║
+  ███████╗██████╔╝ ╚████╔╝ ███████║██║
+  ╚════██║██╔═══╝   ╚██╔╝  ██╔══██║██║
+  ███████║██║        ██║   ██║  ██║██║
+  ╚══════╝╚═╝        ╚═╝   ╚═╝  ╚═╝╚═╝${r}
+${g}  >> passive reconnaissance for AI-facing systems${r}
+${w}  >> authorized targets only • no auth • no exploits${r}
+
+BANNER
+}
+
+spyai_ok() {
+  log_msg "$(color_if_tty 32)[+]$(color_reset) $*"
+}
+
+random_phrase() {
+  echo "${SPYAI_PHRASES[RANDOM % ${#SPYAI_PHRASES[@]}]}"
+}
+
+wait_spinner_start() {
+  wait_spinner_stop 2>/dev/null || true
+  (
+    while true; do
+      printf '\r\033[K%s[*] %s%s' "$(color_if_tty 33)" "$(random_phrase)" "$(color_reset)" >&2
+      sleep 1
+    done
+  ) &
+  WAIT_SPINNER_PID=$!
+}
+
+wait_spinner_stop() {
+  if [[ -n "${WAIT_SPINNER_PID:-}" ]]; then
+    kill "$WAIT_SPINNER_PID" 2>/dev/null || true
+    wait "$WAIT_SPINNER_PID" 2>/dev/null || true
+    WAIT_SPINNER_PID=""
+  fi
+  printf '\r\033[K' >&2
+}
+
+run_with_wait() {
+  wait_spinner_start
+  "$@"
+  local rc=$?
+  wait_spinner_stop
+  return "$rc"
+}
+log_exec() { echo "$@" >>"$EXEC_LOG"; }
+log_exec_section() {
+  {
+    echo ""
+    echo "=== $* ==="
+    echo ""
+  } >>"$EXEC_LOG"
+}
+
+have_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+load_list_file() {
+  local file="$1"
+  local arr_name="$2"
+  eval "${arr_name}=()"
+  [[ -f "$file" ]] || return 1
+  local line
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ "$line" =~ ^#|^$ ]] && continue
+    eval "${arr_name}+=(\"\$line\")"
+  done <"$file"
+}
+
+load_probe_config() {
+  if ! load_list_file "$DEFAULT_PROBE_PATHS" PROBE_PATHS; then
+    PROBE_PATHS=(
+      "/" "/docs" "/redoc" "/openapi.json" "/swagger.json" "/swagger-ui.html"
+      "/health" "/healthz" "/api/health" "/api/chat" "/chat" "/api/v2/assistant"
+      "/api/config" "/api/status" "/api/info" "/api/version" "/api/tags"
+      "/-/health" "/-/ready" "/-/metrics" "/version" "/info" "/metrics"
+      "/robots.txt" "/sitemap.xml" "/v1/models" "/v1/chat/completions"
+      "/api/v1/login" "/api/v4/version" "/users/sign_in"
+      "/minio/health/live" "/minio/health/ready" "/minio/health/cluster"
+      "/minio/admin/v3/info"
+    )
+  fi
+  if ! load_list_file "$DEFAULT_INTERESTING_HEADERS" INTERESTING_HEADERS; then
+    INTERESTING_HEADERS=(
+      "Server" "X-Powered-By" "X-AI-Backend" "X-RAG-Provider" "X-Model"
+      "X-Inference-Engine" "X-Kong-Upstream-Latency" "Via" "Location"
+      "Content-Type" "Content-Security-Policy" "WWW-Authenticate"
+    )
+  fi
+}
+
+require_cmds() {
+  local missing=() cmd
+  for cmd in "$@"; do
+    have_cmd "$cmd" || missing+=("$cmd")
+  done
+  if ((${#missing[@]} > 0)); then
+    log_msg "error: missing required commands: ${missing[*]}"
+    exit 1
+  fi
+}
+
+detect_tls_timeout_cmd() {
+  if have_cmd timeout; then
+    TLS_TIMEOUT_CMD="timeout 8"
+  elif have_cmd gtimeout; then
+    TLS_TIMEOUT_CMD="gtimeout 8"
+  else
+    TLS_TIMEOUT_CMD=""
+  fi
+}
+
+validate_target() {
+  local t="$1"
+  if [[ "$t" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+    return 0
+  fi
+  if [[ "$t" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$ ]]; then
+    return 0
+  fi
+  log_msg "error: invalid target (expected IPv4 or hostname): $t"
+  exit 1
+}
+
+utc_now() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
+
+next_run_id() {
+  local ip="$1" max=0 n base
+  shopt -s nullglob
+  for base in "${OUTPUT_DIR}/${ip}-"*.md; do
+    n="${base##*/}"
+    n="${n#${ip}-}"
+    n="${n%.md}"
+    if [[ "$n" =~ ^[0-9]+$ ]] && (( n > max )); then
+      max=$n
+    fi
+  done
+  shopt -u nullglob
+  echo $((max + 1))
+}
+
+init_exec_log() {
+  : >"$EXEC_LOG"
+  log_exec "spy-ai"
+  log_exec "target: ${TARGET}"
+  log_exec "run_id: ${RUN_ID}"
+  log_exec "started: ${STARTED_AT}"
+  log_exec "probe_paths: ${#PROBE_PATHS[@]}"
+  log_exec "python3: $(have_cmd python3 && echo yes || echo no)"
+  log_exec "openssl: $(have_cmd openssl && echo yes || echo no)"
+  log_exec "timeout: ${TLS_TIMEOUT_CMD:-none}"
+}
+
+# ---- port scan (python TCP connect) --------------------------------------
+
+parse_scan_open_lines() {
+  local file="$1"
+  grep -E '^[0-9]+/tcp[[:space:]]+open' "$file" 2>/dev/null || true
+}
+
+build_scan_ports_csv() {
+  # sort -nu dedupes; avoids bash 4+ associative arrays (macOS default bash is 3.2)
+  {
+    for p in "${COMMON_PORTS[@]}" "${HTTP_LIKELY_PORTS[@]}"; do
+      echo "$p"
+    done
+  } | sort -nu | paste -sd, -
+}
+
+scan_open_ports() {
+  local ip="$1" log="$2"
+  local port_csv
+
+  port_csv="$(build_scan_ports_csv)"
+  log_exec_section "TCP connect port scan (python3)"
+  log_exec "\$ python3 ${SCAN_PORTS_PY} ${ip} -o ${log} -p ${port_csv}"
+  python3 "$SCAN_PORTS_PY" "$ip" -o "$log" -p "$port_csv" >>"$EXEC_LOG" 2>&1
+}
+
+extract_open_ports() {
+  local log="$1"
+  parse_scan_open_lines "$log" | awk -F'/' '{print $1}' | sort -nu
+}
+
+parse_service_table() {
+  local log="$1"
+  SERVICE_DATA=""
+  SERVICE_DATA="$(parse_scan_open_lines "$log" | awk '
+    /^[0-9]+\/tcp[[:space:]]+open/ {
+      split($1, parts, "/")
+      port = parts[1]
+      service = $3
+      $1 = $2 = $3 = ""
+      sub(/^[[:space:]]+/, "")
+      version = $0
+      if (version == "") version = "-"
+      print port "|" service "|" version
+    }
+  ')"
+}
+
+get_service_field() {
+  local port="$1" field="$2" line
+  while IFS= read -r line; do
+    [[ "$line" == "${port}|"* ]] || continue
+    IFS='|' read -r _ svc ver <<<"$line"
+    if [[ "$field" == "1" ]]; then
+      echo "$svc"
+    else
+      echo "$ver"
+    fi
+    return 0
+  done <<<"$SERVICE_DATA"
+  echo "-"
+}
+
+# ---- port classification -------------------------------------------------
+
+port_in_list() {
+  local needle="$1"
+  shift
+  local p
+  for p in "$@"; do
+    [[ "$p" == "$needle" ]] && return 0
+  done
+  return 1
+}
+
+is_http_likely_port() { port_in_list "$1" "${HTTP_LIKELY_PORTS[@]}"; }
+is_https_port() { port_in_list "$1" "${HTTPS_PORTS[@]}"; }
+
+service_combined() {
+  local port="$1" svc ver
+  svc="$(get_service_field "$port" 1)"
+  ver="$(get_service_field "$port" 2)"
+  echo "${svc} ${ver}"
+}
+
+service_mentions_http() {
+  local combined
+  combined="$(service_combined "$1")"
+  [[ "$combined" =~ [Hh][Tt][Tt][Pp] ]]
+}
+
+service_mentions_tls() {
+  local combined
+  combined="$(service_combined "$1")"
+  [[ "$combined" =~ (ssl/|https|tls|TLS) ]]
+}
+
+scheme_for_port() {
+  local port="$1"
+  if is_https_port "$port" || service_mentions_tls "$port"; then
+    echo "https"
+  else
+    echo "http"
+  fi
+}
+
+select_http_ports() {
+  local -a open_ports=("$@") selected=()
+  local port
+  for port in "${open_ports[@]}"; do
+    if is_http_likely_port "$port" || service_mentions_http "$port" || service_mentions_tls "$port"; then
+      selected+=("$port")
+    fi
+  done
+  if ((${#selected[@]} == 0)); then
+    return 0
+  fi
+  printf '%s\n' "${selected[@]}" | sort -nu
+}
+
+# ---- header / body parsing -----------------------------------------------
+
+md_escape() {
+  local s="$1"
+  s="${s//|/\\|}"
+  s="${s//$'\n'/ }"
+  s="${s//$'\r'/}"
+  echo "$s"
+}
+
+# Sanitize a request path into a filesystem-safe suffix.
+safe_path_key() {
+  local p="$1"
+  p="${p//\//_}"
+  p="${p//[^A-Za-z0-9._-]/_}"
+  [[ -z "$p" ]] && p="_root"
+  echo "$p"
+}
+
+extract_header_value() {
+  local file="$1" name="$2"
+  grep -i "^${name}:" "$file" 2>/dev/null \
+    | head -1 \
+    | sed "s/^[^:]*:[[:space:]]*//" \
+    | tr -d '\r' \
+    || true
+}
+
+extract_header_all() {
+  local file="$1" name="$2"
+  grep -i "^${name}:" "$file" 2>/dev/null \
+    | sed "s/^[^:]*:[[:space:]]*//" \
+    | tr -d '\r' \
+    | paste -sd '|' - \
+    | sed 's/|/ || /g' \
+    || true
+}
+
+extract_html_title() {
+  local file="$1"
+  if have_cmd python3; then
+    python3 - "$file" <<'PY' 2>/dev/null || true
+import sys, re
+try:
+    data = open(sys.argv[1], "rb").read().decode("utf-8", errors="replace")
+except Exception:
+    sys.exit(0)
+m = re.search(r"<title[^>]*>([^<]*)</title>", data, re.IGNORECASE | re.DOTALL)
+if m:
+    print(m.group(1).strip())
+PY
+  else
+    tr -d '\r\n' <"$file" 2>/dev/null \
+      | grep -ioE '<title[^>]*>[^<]*</title>' \
+      | head -1 \
+      | sed -E 's/<title[^>]*>([^<]*)<\/title>/\1/' \
+      || true
+  fi
+}
+
+# Extract absolute API paths embedded in HTML/inline JS (fetch, axios, data-*).
+extract_embedded_api_paths() {
+  local file="$1"
+  [[ -s "$file" ]] || return 0
+  if have_cmd python3; then
+    python3 - "$file" 2>/dev/null <<'PY' || true
+import re, sys
+try:
+    data = open(sys.argv[1], "rb").read().decode("utf-8", errors="replace")
+except Exception:
+    sys.exit(0)
+patterns = [
+    r'fetch\s*\(\s*[\'"`]([^\'"` ]+)[\'"`]',
+    r'axios\.(?:get|post|put|patch|delete)\s*\(\s*[\'"`]([^\'"` ]+)[\'"`]',
+    r'data-endpoint\s*=\s*[\'"]([^\'"]+)[\'"]',
+    r'(?:apiBase|assistantEndpoint|endpoint)\s*:\s*[\'"]([^\'"]+)[\'"]',
+]
+seen = set()
+for pat in patterns:
+    for m in re.finditer(pat, data, re.IGNORECASE):
+        p = m.group(1).strip()
+        if p.startswith("/") and not p.startswith("//"):
+            seen.add(p)
+for p in sorted(seen):
+    print(p)
+PY
+  else
+    grep -ioE 'fetch\([[:space:]]*["'\''/][^"'\'']+["'\'']' "$file" 2>/dev/null \
+      | sed -E 's/.*["'\'']([/][^"'\'']+)["'\''].*/\1/' \
+      | grep '^/' \
+      | sort -u \
+      || true
+    grep -ioE 'data-endpoint="[^"]+"' "$file" 2>/dev/null \
+      | sed -E 's/data-endpoint="([^"]+)"/\1/' \
+      | grep '^/' \
+      | sort -u \
+      || true
+  fi
+}
+
+endpoint_already_recorded() {
+  local ep_file="$1" path="$2"
+  [[ -f "$ep_file" ]] || return 1
+  awk -F'\t' -v p="$path" '$1 == p { found=1 } END { exit !found }' "$ep_file"
+}
+
+# Probe paths mined from HTML/JS bodies (e.g. inline fetch('/api/chat')).
+probe_embedded_paths() {
+  local ip="$1" port="$2" scheme="$3" body_file="$4"
+  local ep_file path notes
+  [[ -s "$body_file" ]] || return 0
+  ep_file="${WORK_DIR}/p${port}.endpoints"
+  while IFS= read -r path; do
+    [[ -n "$path" ]] || continue
+    endpoint_already_recorded "$ep_file" "$path" && continue
+    log_exec ""
+    log_exec "(embedded path from HTML/JS) probing ${path}"
+    do_get "$ip" "$port" "$scheme" "$path"
+    [[ -z "$PROBE_STATUS" ]] && continue
+    [[ "$PROBE_STATUS" == "404" ]] && continue
+    notes="embedded=html"
+    extra_notes="$(notes_for_endpoint "$path" "$PROBE_CTYPE" "$PROBE_SIZE" "$PROBE_BODY_FILE")"
+    [[ -n "$extra_notes" ]] && notes="${notes}; ${extra_notes}"
+    printf '%s\t%s\t%s\t%s\t%s\n' "$path" "$PROBE_STATUS" "$PROBE_CTYPE" "$PROBE_SIZE" "$notes" \
+      >>"$ep_file"
+    if [[ "$PROBE_STATUS" == "401" ]] && [[ -n "$PROBE_WWW_AUTH" ]]; then
+      printf '%s\t%s\n' "$path" "$PROBE_WWW_AUTH" >>"${WORK_DIR}/p${port}.auth"
+    fi
+    if [[ "$path" == "/openapi.json" ]] && [[ "$PROBE_STATUS" == "200" ]] && [[ -n "$PROBE_BODY_FILE" ]]; then
+      parse_openapi_json "$PROBE_BODY_FILE" "${WORK_DIR}/p${port}.openapi.txt"
+    fi
+  done < <(extract_embedded_api_paths "$body_file")
+}
+
+parse_openapi_json() {
+  local json="$1" out="$2"
+  if ! have_cmd python3; then
+    echo "(python3 not available; raw spec stashed in workdir)" >"$out"
+    return
+  fi
+  python3 - "$json" >"$out" 2>/dev/null <<'PY' || true
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception as e:
+    print(f"(failed to parse openapi.json: {e})")
+    sys.exit(0)
+info = d.get("info", {}) or {}
+print(f"title: {info.get('title','-')}")
+print(f"version: {info.get('version','-')}")
+desc = info.get("description")
+if desc:
+    desc = desc.strip().splitlines()[0][:200]
+    print(f"description: {desc}")
+servers = d.get("servers") or []
+for s in servers:
+    if isinstance(s, dict):
+        print(f"server: {s.get('url','-')}")
+paths = d.get("paths", {}) or {}
+print(f"paths: {len(paths)}")
+allowed = {"get","post","put","patch","delete","head","options"}
+for p in sorted(paths.keys()):
+    methods = paths[p] or {}
+    if not isinstance(methods, dict):
+        continue
+    for m in sorted(methods.keys()):
+        if m.lower() not in allowed:
+            continue
+        meta = methods[m] or {}
+        summary = meta.get("summary") or ""
+        print(f"  {m.upper():6} {p:35} {summary}")
+PY
+}
+
+# ---- probes --------------------------------------------------------------
+
+# Probe variables (set by do_head / do_get).
+PROBE_STATUS=""
+PROBE_SERVER=""
+PROBE_LOCATION=""
+PROBE_CTYPE=""
+PROBE_SIZE=""
+PROBE_WWW_AUTH=""
+PROBE_ERROR=""
+PROBE_HEADERS_FILE=""
+PROBE_BODY_FILE=""
+
+do_head() {
+  local ip="$1" port="$2" scheme="$3"
+  local url headers_tmp err_tmp http_code curl_err
+
+  url="${scheme}://${ip}:${port}/"
+  headers_tmp="$(mktemp)"
+  err_tmp="${headers_tmp}.err"
+
+  PROBE_STATUS="-"
+  PROBE_SERVER="-"
+  PROBE_LOCATION="-"
+  PROBE_CTYPE="-"
+  PROBE_SIZE="-"
+  PROBE_WWW_AUTH=""
+  PROBE_ERROR=""
+
+  log_exec ""
+  log_exec "\$ curl -sS -k -I --max-time ${CURL_MAX_TIME} ${url}"
+
+  set +e
+  http_code="$(curl -sS -k -I --max-time "${CURL_MAX_TIME}" -o "$headers_tmp" -w '%{http_code}' "$url" 2>"$err_tmp")"
+  curl_err=$?
+  set -e
+
+  if [[ -s "$headers_tmp" ]]; then
+    log_exec "--- response headers ---"
+    cat "$headers_tmp" >>"$EXEC_LOG"
+    log_exec "--- end headers ---"
+  fi
+  if [[ -s "$err_tmp" ]]; then
+    PROBE_ERROR="$(head -1 "$err_tmp" | tr -d '\r')"
+    log_exec "curl stderr: ${PROBE_ERROR}"
+  fi
+
+  if [[ "$curl_err" -ne 0 ]] || [[ -z "$http_code" ]] || [[ "$http_code" == "000" ]]; then
+    log_exec "result: no HTTP response (code=${http_code:-none})"
+    rm -f "$headers_tmp" "$err_tmp"
+    return 0
+  fi
+
+  PROBE_STATUS="$http_code"
+  PROBE_SERVER="$(extract_header_value "$headers_tmp" "Server")"
+  PROBE_LOCATION="$(extract_header_value "$headers_tmp" "Location")"
+  PROBE_CTYPE="$(extract_header_value "$headers_tmp" "Content-Type")"
+  PROBE_WWW_AUTH="$(extract_header_all "$headers_tmp" "WWW-Authenticate")"
+  [[ -z "$PROBE_SERVER" ]] && PROBE_SERVER="-"
+  [[ -z "$PROBE_LOCATION" ]] && PROBE_LOCATION="-"
+  [[ -z "$PROBE_CTYPE" ]] && PROBE_CTYPE="-"
+  log_exec "result: status=${PROBE_STATUS} server=${PROBE_SERVER} ctype=${PROBE_CTYPE} location=${PROBE_LOCATION}"
+  [[ -n "$PROBE_WWW_AUTH" ]] && log_exec "  www-authenticate: ${PROBE_WWW_AUTH}"
+
+  rm -f "$headers_tmp" "$err_tmp"
+}
+
+do_get() {
+  local ip="$1" port="$2" scheme="$3" path="$4"
+  local url headers_tmp body_tmp err_tmp http_code curl_err size
+  local ctype server location www_auth h hv
+
+  url="${scheme}://${ip}:${port}${path}"
+  headers_tmp="$(mktemp)"
+  body_tmp="$(mktemp)"
+  err_tmp="${headers_tmp}.err"
+
+  PROBE_STATUS=""
+  PROBE_SERVER="-"
+  PROBE_LOCATION="-"
+  PROBE_CTYPE="-"
+  PROBE_SIZE="0"
+  PROBE_WWW_AUTH=""
+  PROBE_ERROR=""
+  PROBE_HEADERS_FILE=""
+  PROBE_BODY_FILE=""
+
+  set +e
+  http_code="$(curl -sS -k --max-time "${CURL_MAX_TIME}" -D "$headers_tmp" -o "$body_tmp" -w '%{http_code}' "$url" 2>"$err_tmp")"
+  curl_err=$?
+  set -e
+
+  if [[ "$curl_err" -ne 0 ]] || [[ -z "$http_code" ]] || [[ "$http_code" == "000" ]]; then
+    PROBE_ERROR="$(head -1 "$err_tmp" 2>/dev/null | tr -d '\r' || true)"
+    rm -f "$headers_tmp" "$body_tmp" "$err_tmp"
+    return 0
+  fi
+
+  size=$(wc -c <"$body_tmp" | tr -d ' ')
+  PROBE_STATUS="$http_code"
+  PROBE_SIZE="$size"
+  ctype="$(extract_header_value "$headers_tmp" "Content-Type")"
+  server="$(extract_header_value "$headers_tmp" "Server")"
+  location="$(extract_header_value "$headers_tmp" "Location")"
+  www_auth="$(extract_header_all "$headers_tmp" "WWW-Authenticate")"
+  PROBE_CTYPE="${ctype:--}"
+  PROBE_SERVER="${server:--}"
+  PROBE_LOCATION="${location:--}"
+  PROBE_WWW_AUTH="$www_auth"
+
+  # Persist headers+body for downstream parsing only when not a hard 404.
+  if [[ "$http_code" != "404" ]]; then
+    local key stash_h stash_b
+    key="$(safe_path_key "$path")"
+    stash_h="${WORK_DIR}/p${port}.${key}.headers"
+    stash_b="${WORK_DIR}/p${port}.${key}.body"
+    cp "$headers_tmp" "$stash_h"
+    cp "$body_tmp" "$stash_b"
+    PROBE_HEADERS_FILE="$stash_h"
+    PROBE_BODY_FILE="$stash_b"
+
+    log_exec ""
+    log_exec "\$ curl -sS -k --max-time ${CURL_MAX_TIME} ${url}"
+    log_exec "--- response headers ---"
+    cat "$headers_tmp" >>"$EXEC_LOG"
+    log_exec "--- end headers ---"
+    # Surface any interesting header values explicitly.
+    for h in "${INTERESTING_HEADERS[@]}"; do
+      hv="$(extract_header_all "$headers_tmp" "$h")"
+      [[ -n "$hv" ]] && log_exec "  ${h}: ${hv}"
+    done
+    if [[ "$size" -gt 0 ]]; then
+      log_exec "--- body (first ${MAX_BODY_BYTES} bytes) ---"
+      head -c "$MAX_BODY_BYTES" "$body_tmp" >>"$EXEC_LOG"
+      echo "" >>"$EXEC_LOG"
+      [[ "$size" -gt "$MAX_BODY_BYTES" ]] && log_exec "...[truncated, total=${size} bytes]..."
+      log_exec "--- end body ---"
+    fi
+    log_exec "result: status=${PROBE_STATUS} ctype=${PROBE_CTYPE} size=${PROBE_SIZE} server=${PROBE_SERVER}"
+  fi
+
+  rm -f "$headers_tmp" "$body_tmp" "$err_tmp"
+}
+
+probe_https_cert() {
+  local ip="$1" port="$2" out="$3"
+  if ! have_cmd openssl; then
+    echo "(openssl not available)" >"$out"
+    return
+  fi
+  log_exec ""
+  log_exec "\$ echo | ${TLS_TIMEOUT_CMD:-} openssl s_client -connect ${ip}:${port} -servername ${ip} | openssl x509 -noout -subject -issuer -dates -ext subjectAltName"
+  set +e
+  if [[ -n "$TLS_TIMEOUT_CMD" ]]; then
+    echo | $TLS_TIMEOUT_CMD openssl s_client -connect "${ip}:${port}" -servername "${ip}" 2>/dev/null \
+      | openssl x509 -noout -subject -issuer -dates -ext subjectAltName 2>/dev/null \
+      >"$out"
+  else
+    echo | openssl s_client -connect "${ip}:${port}" -servername "${ip}" 2>/dev/null \
+      | openssl x509 -noout -subject -issuer -dates -ext subjectAltName 2>/dev/null \
+      >"$out"
+  fi
+  set -e
+  if [[ -s "$out" ]]; then
+    log_exec "--- cert info ---"
+    cat "$out" >>"$EXEC_LOG"
+    log_exec "--- end cert ---"
+  else
+    echo "(no cert info collected)" >"$out"
+    log_exec "result: no cert info"
+  fi
+}
+
+# Build the Notes column for the Discovered Endpoints table.
+# - HTML body → title="..."
+# - small JSON body (< INLINE_BODY_BYTES) → body=<snippet>
+notes_for_endpoint() {
+  local path="$1" ctype="$2" size="$3" body_file="$4"
+  local title snippet
+  if [[ "$ctype" == *text/html* ]] && [[ -s "$body_file" ]]; then
+    title="$(extract_html_title "$body_file")"
+    if [[ -n "$title" ]]; then
+      echo "title=\"${title}\""
+      return
+    fi
+  fi
+  if [[ "$ctype" == *json* ]] && [[ -s "$body_file" ]] && [[ "$size" -le "$INLINE_BODY_BYTES" ]]; then
+    snippet="$(head -c "$INLINE_BODY_BYTES" "$body_file" | tr -d '\r\n' | tr -s ' ')"
+    if [[ -n "$snippet" ]]; then
+      echo "body=${snippet}"
+      return
+    fi
+  fi
+  echo ""
+}
+
+# Per-port HTTP discovery: HEAD / + GET PROBE_PATHS + (TLS cert if https).
+discover_http_port() {
+  local ip="$1" port="$2"
+  local scheme path notes
+  scheme="$(scheme_for_port "$port")"
+
+  log_exec_section "http probes :${port} (${scheme})"
+
+  do_head "$ip" "$port" "$scheme"
+  {
+    echo "scheme=${scheme}"
+    echo "status=${PROBE_STATUS}"
+    echo "server=${PROBE_SERVER}"
+    echo "location=${PROBE_LOCATION}"
+    echo "ctype=${PROBE_CTYPE}"
+    echo "www_auth=${PROBE_WWW_AUTH}"
+    [[ -n "$PROBE_ERROR" ]] && echo "error=${PROBE_ERROR}"
+  } >"${WORK_DIR}/p${port}.banner"
+
+  : >"${WORK_DIR}/p${port}.endpoints"
+  : >"${WORK_DIR}/p${port}.auth"
+
+  for path in "${PROBE_PATHS[@]}"; do
+    do_get "$ip" "$port" "$scheme" "$path"
+    if [[ -z "$PROBE_STATUS" ]]; then
+      continue
+    fi
+    if [[ "$PROBE_STATUS" == "404" ]]; then
+      continue
+    fi
+
+    notes="$(notes_for_endpoint "$path" "$PROBE_CTYPE" "$PROBE_SIZE" "$PROBE_BODY_FILE")"
+    printf '%s\t%s\t%s\t%s\t%s\n' "$path" "$PROBE_STATUS" "$PROBE_CTYPE" "$PROBE_SIZE" "$notes" \
+      >>"${WORK_DIR}/p${port}.endpoints"
+
+    if [[ "$PROBE_STATUS" == "401" ]] && [[ -n "$PROBE_WWW_AUTH" ]]; then
+      printf '%s\t%s\n' "$path" "$PROBE_WWW_AUTH" >>"${WORK_DIR}/p${port}.auth"
+    fi
+
+    if [[ "$path" == "/openapi.json" ]] && [[ "$PROBE_STATUS" == "200" ]] && [[ -n "$PROBE_BODY_FILE" ]]; then
+      parse_openapi_json "$PROBE_BODY_FILE" "${WORK_DIR}/p${port}.openapi.txt"
+    fi
+  done
+
+  # Mine inline HTML/JS for API paths (e.g. kb01 fetch('/api/chat') not in wordlist).
+  local root_body="${WORK_DIR}/p${port}._root.body"
+  if [[ -s "$root_body" ]]; then
+    log_exec_section "embedded path mining :${port}"
+    probe_embedded_paths "$ip" "$port" "$scheme" "$root_body"
+  fi
+
+  if [[ "$scheme" == "https" ]]; then
+    probe_https_cert "$ip" "$port" "${WORK_DIR}/p${port}.cert.txt"
+  fi
+
+  probe_agent_health "$ip" "$port" "$scheme"
+}
+
+# Probe uvicorn-style agent /health (Module 3); writes p${port}.agent if JSON agent field found.
+probe_agent_health() {
+  local ip="$1" port="$2" scheme="$3"
+  [[ "$port" =~ ^[0-9]+$ ]] || return 0
+  (( port >= 8000 && port <= 8080 )) || return 0
+  local url h b e code agent reported_port
+  h="${WORK_DIR}/p${port}.health.h"
+  b="${WORK_DIR}/p${port}.health.b"
+  e="${WORK_DIR}/p${port}.health.e"
+  url="${scheme}://${ip}:${port}/health"
+  : >"$h"; : >"$b"; : >"$e"
+  code="$(curl -sS -k --max-time "$CURL_MAX_TIME" -D "$h" -o "$b" -w '%{http_code}' "$url" 2>"$e" || echo 000)"
+  log_exec "agent health GET ${url} -> HTTP ${code}"
+  [[ "$code" == "200" ]] || return 0
+  if have_cmd python3; then
+    agent="$(python3 -c "import json,sys
+try:
+ d=json.load(open(sys.argv[1]))
+ print(d.get('agent') or d.get('service') or '')
+except Exception:
+ print('')" "$b" 2>/dev/null || true)"
+    reported_port="$(python3 -c "import json,sys
+try:
+ d=json.load(open(sys.argv[1]))
+ print(d.get('port') or '')
+except Exception:
+ print('')" "$b" 2>/dev/null || true)"
+  else
+    agent=""
+    reported_port=""
+  fi
+  [[ -n "$agent" ]] || return 0
+  printf '%s\t%s\t%s\t%s\n' "$agent" "${reported_port:-$port}" "$code" "$scheme" \
+    >"${WORK_DIR}/p${port}.agent"
+  log_exec "agent found: ${agent} on :${port}"
+}
+
+# ---- report --------------------------------------------------------------
+
+write_report() {
+  local ip="$1"
+  shift
+  local -a open_ports=("$@") http_ports=()
+  local port svc ver rel_log p banner_file scheme status server location ctype
+  local ep_file path size notes any has_openapi has_auth has_tls f challenge
+
+  while IFS= read -r p; do
+    [[ -n "$p" ]] && http_ports+=("$p")
+  done < <(select_http_ports ${open_ports[@]+"${open_ports[@]}"})
+
+  rel_log="${EXEC_LOG#${SCRIPT_DIR}/}"
+
+  {
+    echo "# Recon Passivo"
+    echo ""
+    echo "- **Target:** ${ip}"
+    echo "- **Run:** ${ip}-${RUN_ID}"
+    echo "- **Started:** ${STARTED_AT}"
+    echo "- **Finished:** ${FINISHED_AT}"
+    echo "- **Tool:** spy-ai"
+    echo "- **Execution log:** ${rel_log}"
+    echo ""
+
+    echo "## Open Ports"
+    echo ""
+    if ((${#open_ports[@]} == 0)); then
+      echo "_No open TCP ports detected._"
+    else
+      echo "| Port | Service |"
+      echo "| ---- | ------- |"
+      for port in "${open_ports[@]}"; do
+        svc="$(get_service_field "$port" 1)"
+        echo "| ${port} | $(md_escape "$svc") |"
+      done
+    fi
+    echo ""
+
+    echo "## HTTP Banners (HEAD /)"
+    echo ""
+    if ((${#http_ports[@]:-0} == 0)); then
+      echo "_No HTTP-likely open ports to probe._"
+    else
+      echo "| Port | Scheme | Status | Server | Content-Type | Location |"
+      echo "| ---- | ------ | ------ | ------ | ------------ | -------- |"
+      for port in ${http_ports[@]+"${http_ports[@]}"}; do
+        banner_file="${WORK_DIR}/p${port}.banner"
+        [[ -f "$banner_file" ]] || continue
+        scheme="$(grep '^scheme=' "$banner_file" | cut -d= -f2-)"
+        status="$(grep '^status=' "$banner_file" | cut -d= -f2-)"
+        server="$(grep '^server=' "$banner_file" | cut -d= -f2-)"
+        location="$(grep '^location=' "$banner_file" | cut -d= -f2-)"
+        ctype="$(grep '^ctype=' "$banner_file" | cut -d= -f2-)"
+        echo "| ${port} | ${scheme:-http} | ${status:--} | $(md_escape "${server:--}") | $(md_escape "${ctype:--}") | $(md_escape "${location:--}") |"
+      done
+    fi
+    echo ""
+
+    echo "## Discovered Endpoints"
+    echo ""
+    any=0
+    for port in ${http_ports[@]+"${http_ports[@]}"}; do
+      ep_file="${WORK_DIR}/p${port}.endpoints"
+      [[ -s "$ep_file" ]] || continue
+      any=1
+      scheme="$(grep '^scheme=' "${WORK_DIR}/p${port}.banner" 2>/dev/null | cut -d= -f2- || echo http)"
+      echo "### Port ${port} (${scheme})"
+      echo ""
+      echo "| Path | Status | Content-Type | Size | Notes |"
+      echo "| ---- | ------ | ------------ | ---- | ----- |"
+      while IFS=$'\t' read -r path status ctype size notes; do
+        echo "| $(md_escape "$path") | ${status} | $(md_escape "${ctype:--}") | ${size} | $(md_escape "${notes:--}") |"
+      done <"$ep_file"
+      echo ""
+    done
+    if (( any == 0 )); then
+      echo "_No non-404 endpoints discovered._"
+      echo ""
+    fi
+
+    has_openapi=0
+    for port in ${http_ports[@]+"${http_ports[@]}"}; do
+      if [[ -s "${WORK_DIR}/p${port}.openapi.txt" ]]; then
+        has_openapi=1
+        break
+      fi
+    done
+    if (( has_openapi == 1 )); then
+      echo "## OpenAPI Schemas"
+      echo ""
+      for port in ${http_ports[@]+"${http_ports[@]}"}; do
+        f="${WORK_DIR}/p${port}.openapi.txt"
+        [[ -s "$f" ]] || continue
+        echo "### Port ${port}"
+        echo ""
+        echo '```text'
+        cat "$f"
+        echo '```'
+        echo ""
+      done
+    fi
+
+    has_agent=0
+    for port in ${http_ports[@]+"${http_ports[@]}"}; do
+      [[ -s "${WORK_DIR}/p${port}.agent" ]] && has_agent=1 && break
+    done
+    if (( has_agent == 1 )); then
+      echo "## Agent Services"
+      echo ""
+      echo "JSON \`/health\` endpoints exposing an \`agent\` field (Module 3 uvicorn agents)."
+      echo ""
+      echo "| Port | Agent | Health Port | Scheme |"
+      echo "| ---- | ----- | ----------- | ------ |"
+      for port in ${http_ports[@]+"${http_ports[@]}"}; do
+        f="${WORK_DIR}/p${port}.agent"
+        [[ -s "$f" ]] || continue
+        while IFS=$'\t' read -r agent reported_port code scheme; do
+          echo "| ${port} | $(md_escape "$agent") | ${reported_port} | ${scheme} |"
+        done <"$f"
+      done
+      echo ""
+    fi
+
+    has_auth=0
+    for port in ${http_ports[@]+"${http_ports[@]}"}; do
+      if [[ -s "${WORK_DIR}/p${port}.auth" ]]; then
+        has_auth=1
+        break
+      fi
+    done
+    if (( has_auth == 1 )); then
+      echo "## Auth Challenges (401 responses)"
+      echo ""
+      echo "| Port | Path | WWW-Authenticate |"
+      echo "| ---- | ---- | ---------------- |"
+      for port in ${http_ports[@]+"${http_ports[@]}"}; do
+        f="${WORK_DIR}/p${port}.auth"
+        [[ -s "$f" ]] || continue
+        while IFS=$'\t' read -r path challenge; do
+          echo "| ${port} | $(md_escape "$path") | $(md_escape "$challenge") |"
+        done <"$f"
+      done
+      echo ""
+    fi
+
+    has_tls=0
+    for port in ${http_ports[@]+"${http_ports[@]}"}; do
+      if [[ -s "${WORK_DIR}/p${port}.cert.txt" ]]; then
+        has_tls=1
+        break
+      fi
+    done
+    if (( has_tls == 1 )); then
+      echo "## TLS Certificates"
+      echo ""
+      for port in ${http_ports[@]+"${http_ports[@]}"}; do
+        f="${WORK_DIR}/p${port}.cert.txt"
+        [[ -s "$f" ]] || continue
+        echo "### Port ${port}"
+        echo ""
+        echo '```text'
+        cat "$f"
+        echo '```'
+        echo ""
+      done
+    fi
+
+    echo "## Notes"
+    echo ""
+    echo "- Port scan: python3 TCP connect on ${#COMMON_PORTS[@]} common + ${#HTTP_LIKELY_PORTS[@]} AI-likely ports (8000-8080, 9000, etc.). Service names are heuristic; use nmap separately for \`-sV\`."
+    echo "- HTTP probes: \`HEAD /\` for banner + \`GET\` on ${#PROBE_PATHS[@]} well-known paths per port."
+    echo "- HTML/JS mining: \`fetch()\`, \`axios.*()\`, \`data-endpoint\`, and JS config keys on \`/\` body."
+    echo "- Only non-404 endpoints listed under Discovered Endpoints."
+    echo "- TLS cert mining requires openssl."
+    echo "- Full tool output: \`${rel_log}\`"
+  } >"$REPORT_PATH"
+}
+
+main() {
+  if [[ $# -ne 1 ]]; then
+    usage
+    exit 1
+  fi
+  if [[ "${1}" == "-h" ]] || [[ "${1}" == "--help" ]]; then
+    usage
+    exit 0
+  fi
+
+  TARGET="$1"
+  validate_target "$TARGET"
+  require_cmds python3 curl
+  if [[ ! -f "$SCAN_PORTS_PY" ]]; then
+    log_msg "error: missing ${SCAN_PORTS_PY}"
+    exit 1
+  fi
+  detect_tls_timeout_cmd
+  load_probe_config
+
+  mkdir -p "$OUTPUT_DIR" "$LOGS_DIR"
+
+  RUN_ID="$(next_run_id "$TARGET")"
+  ARTIFACT_BASE="${OUTPUT_DIR}/${TARGET}-${RUN_ID}"
+  PORTS_SCAN_LOG="${LOGS_DIR}/${TARGET}-${RUN_ID}.ports-scan.tmp"
+  REPORT_PATH="${ARTIFACT_BASE}.md"
+  EXEC_LOG="${LOGS_DIR}/${TARGET}-${RUN_ID}.exec.log"
+  WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/passive-recon.XXXXXX")"
+  trap 'wait_spinner_stop 2>/dev/null || true; rm -rf "$WORK_DIR"' EXIT
+
+  STARTED_AT="$(utc_now)"
+  init_exec_log
+
+  show_banner
+  spyai_ok "target: ${TARGET}  run #${RUN_ID}"
+  log_step "[1/3] port scan"
+  run_with_wait scan_open_ports "$TARGET" "$PORTS_SCAN_LOG"
+
+  local -a open_ports=()
+  local p
+  while IFS= read -r p; do
+    [[ -n "$p" ]] && open_ports+=("$p")
+  done < <(extract_open_ports "$PORTS_SCAN_LOG")
+  parse_service_table "$PORTS_SCAN_LOG"
+
+  local -a http_ports=()
+  while IFS= read -r p; do
+    [[ -n "$p" ]] && http_ports+=("$p")
+  done < <(select_http_ports ${open_ports[@]+"${open_ports[@]}"})
+
+  if ((${#http_ports[@]:-0} > 0)); then
+    log_step "[2/3] http discovery (${#http_ports[@]:-0} port(s) × ${#PROBE_PATHS[@]} paths)"
+    wait_spinner_start
+    for p in ${http_ports[@]+"${http_ports[@]}"}; do
+      discover_http_port "$TARGET" "$p"
+    done
+    wait_spinner_stop
+  else
+    log_step "[2/3] http discovery (skipped)"
+  fi
+
+  log_step "[3/3] writing report"
+  wait_spinner_start
+  FINISHED_AT="$(utc_now)"
+  log_exec ""
+  log_exec "finished: ${FINISHED_AT}"
+  write_report "$TARGET" ${open_ports[@]+"${open_ports[@]}"}
+  wait_spinner_stop
+
+  rm -f "$PORTS_SCAN_LOG"
+
+  spyai_ok "report: ${REPORT_PATH#${SCRIPT_DIR}/}"
+  spyai_ok "log:    ${EXEC_LOG#${SCRIPT_DIR}/}"
+  spyai_ok "open ports: ${#open_ports[@]}"
+}
+
+main "$@"

@@ -1,0 +1,15 @@
+# Scan artifacts (generated per run)
+output/*
+!output/.gitkeep
+
+# macOS / editor
+.DS_Store
+*.swp
+*~
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Temp files from runs
+*.tmp

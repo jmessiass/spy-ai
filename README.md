@@ -6,13 +6,14 @@ SpyAI scans hosts on the public internet or your lab for the ports, HTTP banners
 
 ## What it does
 
-1. **Port scan** — parallel TCP connect (`python3`, stdlib only) on a compact common port set plus AI-likely ports (8000–8080, 9000, 9200, 11434, 5601, 3000, etc.).
+1. **Port scan** — parallel TCP connect (`python3`, stdlib only) on a compact common port set plus AI-likely ports (8000–8080, 9000, 9200, 11434, 5601, 5678/n8n, 3000, etc.).
 2. **HTTP fingerprinting** — `HEAD /` banners per HTTP-likely open port.
 3. **Endpoint discovery** — `GET` on a curated wordlist (`/openapi.json`, `/health`, `/v1/models`, `/api/chat`, MinIO health paths, and more).
 4. **HTML/JS mining** — extracts embedded API paths from `fetch()`, `axios`, `data-endpoint`, and common JS config keys on `/`.
 5. **OpenAPI parsing** — lists paths and methods when `/openapi.json` returns 200.
 6. **Agent health** — detects uvicorn-style `/health` JSON with an `agent` field.
-7. **TLS certificates** — subject, issuer, dates, SANs on HTTPS ports (optional `openssl`).
+7. **A2A Agent Cards** — parses `/.well-known/agent.json` on ports 8000–8080 (name, description, skills, service endpoint).
+8. **TLS certificates** — subject, issuer, dates, SANs on HTTPS ports (optional `openssl`).
 
 Service names in the report are **heuristic** (port-based). For full version detection or top-1000 sweeps, run **nmap separately** and use SpyAI for AI-focused HTTP discovery.
 

@@ -30,6 +30,7 @@ SERVICE_HINTS: dict[int, Tuple[str, str]] = {
     5000: ("http", "-"),
     5432: ("postgresql", "-"),
     5601: ("http", "kibana"),
+    5678: ("http", "n8n"),
     6379: ("redis", "-"),
     8081: ("http-proxy", "-"),
     8443: ("https-alt", "-"),

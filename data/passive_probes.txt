@@ -32,3 +32,11 @@
 /minio/health/ready
 /minio/health/cluster
 /minio/admin/v3/info
+/rest/settings
+/rest/login
+/webhook/
+/webhook-test/
+/.well-known/agent.json
+/a2a
+/a2a/skills
+/a2a/workflow

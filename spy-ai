@@ -17,6 +17,7 @@ readonly -a COMMON_PORTS=(
 # HTTP-likely ports for AI-facing services
 readonly -a HTTP_LIKELY_PORTS=(
   80 443 3000 3001 4000 5000 5601 5678
+  6333 6334
   $(seq 8000 8080)
   8081 8443 8888 9000 9001 9200 11434
 )
@@ -189,6 +190,7 @@ load_probe_config() {
       "/minio/admin/v3/info"
       "/rest/settings" "/rest/login" "/webhook/" "/webhook-test/"
       "/.well-known/agent.json" "/a2a" "/a2a/skills" "/a2a/workflow"
+      "/collections"
     )
   fi
   if ! load_list_file "$DEFAULT_INTERESTING_HEADERS" INTERESTING_HEADERS; then
@@ -371,7 +373,7 @@ scheme_for_port() {
 select_http_ports() {
   local -a open_ports=("$@") selected=()
   local port
-  for port in "${open_ports[@]}"; do
+  for port in ${open_ports[@]+"${open_ports[@]}"}; do
     if is_http_likely_port "$port" || service_mentions_http "$port" || service_mentions_tls "$port"; then
       selected+=("$port")
     fi
@@ -935,7 +937,7 @@ write_report() {
     else
       echo "| Port | Service |"
       echo "| ---- | ------- |"
-      for port in "${open_ports[@]}"; do
+      for port in ${open_ports[@]+"${open_ports[@]}"}; do
         svc="$(get_service_field "$port" 1)"
         echo "| ${port} | $(md_escape "$svc") |"
       done
@@ -1094,7 +1096,7 @@ write_report() {
 
     echo "## Notes"
     echo ""
-    echo "- Port scan: python3 TCP connect on ${#COMMON_PORTS[@]} common + ${#HTTP_LIKELY_PORTS[@]} AI-likely ports (8000-8080, 9000, etc.). Service names are heuristic; use nmap separately for \`-sV\`."
+    echo "- Port scan: python3 TCP connect on ${#COMMON_PORTS[@]} common + ${#HTTP_LIKELY_PORTS[@]} AI-likely ports (6333/6334 Qdrant, 8000-8080, 9000, etc.). Service names are heuristic; use nmap separately for \`-sV\`."
     echo "- HTTP probes: \`HEAD /\` for banner + \`GET\` on ${#PROBE_PATHS[@]} well-known paths per port."
     echo "- HTML/JS mining: \`fetch()\`, \`axios.*()\`, \`data-endpoint\`, and JS config keys on \`/\` body."
     echo "- A2A enumeration: \`/.well-known/agent.json\` on ports 8000–8080; probes include \`/a2a/*\` workflow paths."

@@ -40,3 +40,4 @@
 /a2a
 /a2a/skills
 /a2a/workflow
+/collections

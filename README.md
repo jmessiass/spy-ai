@@ -6,9 +6,9 @@ SpyAI scans hosts on the public internet or your lab for the ports, HTTP banners
 
 ## What it does
 
-1. **Port scan** — parallel TCP connect (`python3`, stdlib only) on a compact common port set plus AI-likely ports (8000–8080, 9000, 9200, 11434, 5601, 5678/n8n, 3000, etc.).
+1. **Port scan** — parallel TCP connect (`python3`, stdlib only) on a compact common port set plus AI-likely ports (6333/6334 Qdrant, 8000–8080, 9000, 9200, 11434, 5601, 5678/n8n, 3000, etc.).
 2. **HTTP fingerprinting** — `HEAD /` banners per HTTP-likely open port.
-3. **Endpoint discovery** — `GET` on a curated wordlist (`/openapi.json`, `/health`, `/v1/models`, `/api/chat`, MinIO health paths, and more).
+3. **Endpoint discovery** — `GET` on a curated wordlist (`/openapi.json`, `/health`, `/v1/models`, `/api/chat`, `/collections` for Qdrant/vector stores, MinIO health paths, and more).
 4. **HTML/JS mining** — extracts embedded API paths from `fetch()`, `axios`, `data-endpoint`, and common JS config keys on `/`.
 5. **OpenAPI parsing** — lists paths and methods when `/openapi.json` returns 200.
 6. **Agent health** — detects uvicorn-style `/health` JSON with an `agent` field.
@@ -19,7 +19,7 @@ Service names in the report are **heuristic** (port-based). For full version det
 
 ## Why SpyAI
 
-Generic port scanners miss predictable AI stack surfaces: inference APIs on high ports, OpenAPI docs, RAG health endpoints, and custom headers (`X-AI-Backend`, `X-RAG-Provider`, etc.). SpyAI targets those footprints with minimal dependencies so you can map an AI-facing attack surface quickly.
+Generic port scanners miss predictable AI stack surfaces: inference APIs on high ports, OpenAPI docs, RAG health endpoints, vector-store APIs (Qdrant on `:6333` with `/collections`), and custom headers (`X-AI-Backend`, `X-RAG-Provider`, etc.). SpyAI targets those footprints with minimal dependencies so you can map an AI-facing attack surface quickly.
 
 ## Install
 
@@ -86,6 +86,7 @@ Each run increments `<target>-<N>` (e.g. `api.example.com-2.md` on a second scan
 | Path | Status | Content-Type | Size | Notes |
 | /openapi.json | 200 | application/json | 1234 | |
 | /health | 200 | application/json | 89 | |
+| /collections | 200 | application/json | 60 | body={"result":{"collections":[]},...} |
 ```
 
 See also optional sections: **OpenAPI Schemas**, **Agent Services**, **Auth Challenges (401)**, **TLS Certificates**.
@@ -94,10 +95,10 @@ See also optional sections: **OpenAPI Schemas**, **Agent Services**, **Auth Chal
 
 Edit wordlists in `data/` (one entry per line; `#` comments allowed):
 
-- **`passive_probes.txt`** — HTTP paths to `GET` on each open HTTP-likely port.
+- **`passive_probes.txt`** — HTTP paths to `GET` on each open HTTP-likely port (e.g. `/collections` for Qdrant fingerprinting).
 - **`interesting_headers.txt`** — response headers echoed in the execution log.
 
-To add ports to the TCP scan, edit `COMMON_PORTS` or `HTTP_LIKELY_PORTS` in `spy-ai` (or extend `lib/scan_ports.py` `SERVICE_HINTS` for report labels).
+To add ports to the TCP scan, edit `COMMON_PORTS` or `HTTP_LIKELY_PORTS` in `spy-ai` (e.g. `6333`/`6334` for Qdrant, or extend `lib/scan_ports.py` `SERVICE_HINTS` for report labels).
 
 ## Passive vs active
 

@@ -1,25 +1,76 @@
 # SpyAI
 
-**SpyAI — passive reconnaissance for AI-facing systems**
+**Passive reconnaissance for AI-facing systems**
 
-SpyAI scans hosts on the public internet or your lab for the ports, HTTP banners, API paths, and TLS footprints typical of LLM agents, RAG backends, vector stores, and adjacent infrastructure. It produces a Markdown report plus a full execution log—no authentication, no fuzzing, no exploits.
+SpyAI maps ports, APIs, agents, and AI infrastructure with read-only probes — no credentials, no fuzzing, no exploits. It targets the footprints typical of LLM agents, RAG backends, vector stores, and adjacent infrastructure, then produces a Markdown report plus a full execution log.
 
-## What it does
+<p align="center">
+  <img src="spy-ai-overview.png" alt="SpyAI — techniques" width="920">
+</p>
 
-1. **Port scan** — parallel TCP connect (`python3`, stdlib only) on a compact common port set plus AI-likely ports (6333/6334 Qdrant, 8000–8080, 9000, 9200, 11434, 5601, 5678/n8n, 3000, etc.).
-2. **HTTP fingerprinting** — `HEAD /` banners per HTTP-likely open port.
-3. **Endpoint discovery** — `GET` on a curated wordlist (`/openapi.json`, `/health`, `/v1/models`, `/api/chat`, `/collections` for Qdrant/vector stores, MinIO health paths, and more).
-4. **HTML/JS mining** — extracts embedded API paths from `fetch()`, `axios`, `data-endpoint`, and common JS config keys on `/`.
-5. **OpenAPI parsing** — lists paths and methods when `/openapi.json` returns 200.
-6. **Agent health** — detects uvicorn-style `/health` JSON with an `agent` field.
-7. **A2A Agent Cards** — parses `/.well-known/agent.json` on ports 8000–8080 (name, description, skills, service endpoint).
-8. **TLS certificates** — subject, issuer, dates, SANs on HTTPS ports (optional `openssl`).
+---
 
-Service names in the report are **heuristic** (port-based). For full version detection or top-1000 sweeps, run **nmap separately** and use SpyAI for AI-focused HTTP discovery.
+## Execution flow
 
-## Why SpyAI
+Each run follows three phases:
 
-Generic port scanners miss predictable AI stack surfaces: inference APIs on high ports, OpenAPI docs, RAG health endpoints, vector-store APIs (Qdrant on `:6333` with `/collections`), and custom headers (`X-AI-Backend`, `X-RAG-Provider`, etc.). SpyAI targets those footprints with minimal dependencies so you can map an AI-facing attack surface quickly.
+| Phase | What happens |
+| ----- | ------------ |
+| **1 · Port Scan** | Parallel TCP connect (`python3`, stdlib) on common ports plus AI-likely ports |
+| **2 · HTTP Discovery** | Fingerprinting, endpoint probing, HTML/JS mining, OpenAPI and agent parsing |
+| **3 · Report** | Structured Markdown report and full execution log under `output/` |
+
+---
+
+## Techniques
+
+### Port Scan
+
+- TCP connect (`python3`, stdlib only — no nmap required)
+- Common ports + AI-likely ports: 6333/6334 Qdrant, 8000–8080, 11434 Ollama, 5601, 5678/n8n, 9000, 9200, etc.
+- Heuristic service labels in the report (port-based; use nmap separately for `-sV`)
+
+### HTTP Fingerprinting
+
+- `HEAD /` banners per HTTP-likely open port
+- Interesting headers: `Server`, `X-AI-Backend`, `X-RAG-Provider`, `X-Model`, `X-Inference-Engine`
+- Automatic http vs https scheme detection
+
+### Endpoint Discovery
+
+- `GET` on a curated wordlist (~40 paths) from `data/passive_probes.txt`
+- AI-relevant paths: `/openapi.json`, `/health`, `/v1/models`, `/api/chat`, `/collections`, `/minio/health/*`, `/a2a/*`
+
+### HTML / JS Mining
+
+- Extracts embedded API paths from `fetch()`, `axios.*()`, `data-endpoint`, and JS config keys (`apiBase`, `endpoint`) on `/`
+- Automatically probes any newly discovered paths
+
+### OpenAPI & Agents
+
+- Parses `/openapi.json` — lists paths, methods, and summaries when status is 200
+- **Agent health** — detects uvicorn-style `/health` JSON with an `agent` field (ports 8000–8080)
+- **A2A Agent Cards** — parses `/.well-known/agent.json` (name, description, skills, service endpoint)
+
+### TLS & Auth
+
+- TLS certificate mining via `openssl` — subject, issuer, dates, SANs (optional)
+- Logs `401` responses with `WWW-Authenticate` challenges
+
+---
+
+## Dependencies
+
+| Tool | Required | Enables |
+| ---- | -------- | ------- |
+| `python3` | Yes | TCP port scan, OpenAPI/HTML parsing, agent `/health` JSON |
+| `curl` | Yes | `HEAD` / `GET` HTTP probes |
+| `openssl` | No | TLS certificate mining |
+| `timeout` / `gtimeout` | No | Bounds TLS handshake (macOS: `brew install coreutils`) |
+
+**Not required:** `nmap`. Use it separately for broader port coverage or version probes.
+
+---
 
 ## Install
 
@@ -28,17 +79,6 @@ git clone https://github.com/jmessiass/spy-ai.git
 cd spy-ai
 chmod +x spy-ai lib/scan_ports.py
 ```
-
-## Dependencies
-
-| Tool | Required | Enables |
-|------|----------|---------|
-| `python3` | Yes | TCP port scan (`lib/scan_ports.py`), OpenAPI/HTML parsing, agent `/health` JSON |
-| `curl` | Yes | HTTP probes |
-| `openssl` | No | TLS certificate mining |
-| `timeout` or `gtimeout` | No | Bounds TLS handshake (macOS: `brew install coreutils` for `gtimeout`) |
-
-**Not required:** `nmap`. Use it on your own if you want broader port coverage or `-sV` version probes.
 
 ## Usage
 
@@ -50,27 +90,24 @@ chmod +x spy-ai lib/scan_ports.py
 
 The target may be an IPv4 address or a hostname (FQDN).
 
-## Output layout
-
-Reports and logs are written under `output/` next to the script:
+## Project layout
 
 ```
 spy-ai/
-├── spy-ai
+├── spy-ai                          # main script
+├── spy-ai-overview.png             # visual overview diagram
 ├── lib/
-│   └── scan_ports.py
+│   └── scan_ports.py               # parallel TCP connect scanner
 ├── data/
-│   ├── passive_probes.txt
-│   └── interesting_headers.txt
+│   ├── passive_probes.txt          # HTTP path wordlist
+│   └── interesting_headers.txt     # headers echoed in exec log
 └── output/
-    ├── 192.168.1.10-1.md
+    ├── <target>-N.md
     └── logs/
-        └── 192.168.1.10-1.exec.log
+        └── <target>-N.exec.log
 ```
 
-Each run increments `<target>-<N>` (e.g. `api.example.com-2.md` on a second scan).
-
-### Sample report sections
+### Sample report excerpt
 
 ```markdown
 ## Open Ports
@@ -89,20 +126,18 @@ Each run increments `<target>-<N>` (e.g. `api.example.com-2.md` on a second scan
 | /collections | 200 | application/json | 60 | body={"result":{"collections":[]},...} |
 ```
 
-See also optional sections: **OpenAPI Schemas**, **Agent Services**, **Auth Challenges (401)**, **TLS Certificates**.
-
 ## Customization
 
 Edit wordlists in `data/` (one entry per line; `#` comments allowed):
 
-- **`passive_probes.txt`** — HTTP paths to `GET` on each open HTTP-likely port (e.g. `/collections` for Qdrant fingerprinting).
-- **`interesting_headers.txt`** — response headers echoed in the execution log.
+- **`passive_probes.txt`** — HTTP paths to `GET` on each open HTTP-likely port
+- **`interesting_headers.txt`** — response headers echoed in the execution log
 
-To add ports to the TCP scan, edit `COMMON_PORTS` or `HTTP_LIKELY_PORTS` in `spy-ai` (e.g. `6333`/`6334` for Qdrant, or extend `lib/scan_ports.py` `SERVICE_HINTS` for report labels).
+To add ports to the TCP scan, edit `COMMON_PORTS` or `HTTP_LIKELY_PORTS` in `spy-ai`, or extend `SERVICE_HINTS` in `lib/scan_ports.py` for report labels.
 
 ## Passive vs active
 
-SpyAI does **not** send credentials or exploit payloads. From the application’s perspective it is passive (read-only probes). It still generates **active network traffic** (TCP connect + `curl`)—use only on systems you are authorized to test.
+> SpyAI does **not** send credentials or exploit payloads. From the application's perspective it is passive (read-only probes). It still generates **active network traffic** (TCP connect + `curl`) — use only on systems you are authorized to test.
 
 ## Legal
 

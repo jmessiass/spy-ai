@@ -10,6 +10,57 @@ SpyAI maps ports, APIs, agents, and AI infrastructure with read-only probes — 
 
 ---
 
+## Sample run
+
+One command against a single authorized lab target:
+
+```bash
+./spy-ai 192.168.217.21
+```
+
+**~66 seconds later** — no chat message sent, no credentials used — SpyAI returned a full attack-surface map.
+
+**7 open ports**, five of them in the AI-likely range, plus a PostgreSQL backend:
+
+```
+22  5432  8001  8002  8003  8011  8012
+```
+
+**5 LLM agents**, identified from unauthenticated `/health` responses:
+
+| Port | Agent |
+| ---- | ----- |
+| 8001 | IT Helpdesk Assistant |
+| 8002 | Secure IT Assistant |
+| 8003 | Knowledge Base Assistant |
+| 8011 | Secure Engineering Portal |
+| 8012 | Department Resources Assistant |
+
+**Endpoints confirmed on each agent port:**
+
+| Path | Status | What it signals |
+| ---- | ------ | --------------- |
+| `/` | 200 | Chat UI — JS mining target |
+| `/docs` | 200 | Interactive Swagger UI |
+| `/redoc` | 200 | API documentation |
+| `/openapi.json` | 200 | Full schema — 16 paths |
+| `/health` | 200 | Agent identity |
+| `/chat` | 405 | POST-only — confirmed via JS mining |
+
+**The exposed OpenAPI schema listed 16 routes**, identical across all five ports — one codebase, five agent personas, one shared attack surface. Among them:
+
+- `/debug/db-schema`, `/debug/query` — debug surface
+- `/kb/add`, `/kb/search`, `/upload`, `/summarize` — RAG ingestion and retrieval
+- `/logs/last-tool-call`, `/logs/latest` — agent tool-call traces
+
+**Cost:** 106 TCP connects and under 200 HTTP requests. No credentials, no fuzzing, no exploits.
+
+Full walkthrough of the seven techniques: [Spy Before You Prompt](https://medium.com/@jmessias/spy-before-you-prompt-passive-recon-for-llm-agents-rag-and-the-ai-stack-3feb2f72aa9b)
+
+> **Lab disclaimer:** `192.168.217.21` is a private RFC1918 address inside an isolated personal lab environment, not reachable from the public internet. No sensitive or proprietary information is disclosed.
+
+---
+
 ## Execution flow
 
 Each run follows three phases:

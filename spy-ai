@@ -19,7 +19,7 @@ readonly -a HTTP_LIKELY_PORTS=(
   80 443 3000 3001 4000 5000 5601 5678
   6333 6334
   $(seq 8000 8080)
-  8081 8443 8888 9000 9001 9200 11434
+  8081 8443 8888 9000 9001 9200 11434 8082 8500 8501  # TorchServe(8082), TF Serving(8500-8501)
 )
 
 # Ports treated as HTTPS by default (in addition to service-name heuristics).
